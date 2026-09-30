@@ -1,0 +1,58 @@
+#!/usr/bin/env node
+// Abre o Native Access (Wine) e entrega links native-access:// (login) para a cópia já aberta.
+//
+// Problema: no Wine, o Electron não encontra a cópia que já está aberta. Quando o navegador
+// devolve o login (native-access://authorize?code=...), abre uma SEGUNDA cópia, que falha com
+// "login: no PKCE verifier available" (erro de JavaScript), porque o verificador PKCE só existe
+// na primeira cópia.
+//
+// Solução: o app roda com --inspect (só em 127.0.0.1) e este script dispara nele o mesmo
+// evento 'second-instance' que o Electron dispararia no Windows.
+//
+// Precisa de Node 22+ (fetch e WebSocket nativos).
+const { spawn } = require('child_process');
+const os = require('os');
+
+const PORT = Number(process.env.NA_INSPECT_PORT || 9229);
+const WINEPREFIX = process.env.WINEPREFIX || `${os.homedir()}/.wine`;
+const EXE = 'C:\\Program Files\\Native Instruments\\Native Access\\Native Access.exe';
+const url = process.argv.slice(2).find(a => a.startsWith('native-access://'));
+
+async function alvo() {
+  try {
+    const r = await fetch(`http://127.0.0.1:${PORT}/json/list`, { signal: AbortSignal.timeout(1500) });
+    return (await r.json())[0]?.webSocketDebuggerUrl;
+  } catch { return null; }
+}
+
+function entregar(ws, link) {
+  return new Promise((ok, falha) => {
+    const s = new WebSocket(ws);
+    const expr = `(() => { const { app, BrowserWindow } = process.mainModule.require('electron');
+      const link = ${JSON.stringify(link)};
+      if (link) app.emit('second-instance', {}, [${JSON.stringify(EXE)}, link], 'C:\\\\', {});
+      const w = BrowserWindow.getAllWindows()[0]; if (w) { w.show(); w.focus(); }
+      return 'ok'; })()`;
+    s.onopen = () => s.send(JSON.stringify({ id: 1, method: 'Runtime.evaluate', params: { expression: expr } }));
+    s.onmessage = m => { s.close(); ok(JSON.parse(m.data)); };
+    s.onerror = e => falha(e);
+    setTimeout(() => falha(new Error('timeout')), 5000);
+  });
+}
+
+(async () => {
+  const ws = await alvo();
+  if (ws) {
+    // Já existe uma cópia aberta: entrega o link (se houver) e traz a janela para frente.
+    const r = await entregar(ws, url || '');
+    if (url) console.log('entregue:', JSON.stringify(r));
+    return;
+  }
+  // Nenhuma cópia aberta: abre uma nova com a porta de controle.
+  const args = [EXE, '--no-sandbox', '--disable-gpu', `--inspect=127.0.0.1:${PORT}`];
+  if (url) args.push(url);
+  spawn('wine', args, {
+    detached: true, stdio: 'ignore',
+    env: { ...process.env, WINEPREFIX, WINEDEBUG: '-all' },
+  }).unref();
+})();
